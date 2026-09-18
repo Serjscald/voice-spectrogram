@@ -2,46 +2,62 @@
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
-<title>Анализ голоса — спектрограмма</title>
+<title>Анализ голоса — Логарифмическая спектрограмма</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 960px; margin: 20px auto; padding: 0 16px; color: #222; }
-  h1 { margin: 0 0 10px; }
-  .hint { background: #eef6ff; border-left: 4px solid #2b7cff; padding: 10px 14px; border-radius: 4px; }
-  #status { margin: 14px 0; font-size: 18px; font-weight: 600; }
-  .rec { color: #d33; }
-  canvas { display: block; width: 100%; max-width: 900px; border: 1px solid #bbb; background: #000; margin-top: 8px; }
-  .controls { margin: 14px 0; display: flex; gap: 10px; flex-wrap: wrap; }
-  button { padding: 10px 16px; font-size: 15px; cursor: pointer; border: 1px solid #666; background: #fafafa; border-radius: 4px; }
-  button:disabled { opacity: .5; cursor: not-allowed; }
-  button:hover:not(:disabled) { background: #eef; }
-  .meta { font-size: 13px; color: #555; margin-top: 6px; }
-  @media print { .noprint { display: none; } }
+  body { font-family: system-ui, sans-serif; max-width: 960px; margin: 20px auto; padding: 0 16px; color: #222; background: #f9f9f9; }
+  h1 { margin: 0 0 10px; color: #333; }
+  .hint { background: #eef6ff; border-left: 4px solid #2b7cff; padding: 10px 14px; border-radius: 4px; margin-bottom: 20px; }
+  #status { margin: 14px 0; font-size: 18px; font-weight: 600; min-height: 27px; }
+  .rec { color: #d33; animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
+  
+  /* Контейнер для канваса, чтобы он был адаптивным */
+  .canvas-container { position: relative; width: 100%; max-width: 900px; margin: 0 auto; border: 1px solid #ccc; background: #000; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+  canvas { display: block; width: 100%; height: auto; }
+  
+  .controls { margin: 20px 0; display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+  button { padding: 10px 20px; font-size: 15px; cursor: pointer; border: none; background: #2b7cff; color: white; border-radius: 6px; transition: background 0.2s; font-weight: 500; }
+  button:disabled { background: #ccc; cursor: not-allowed; }
+  button:hover:not(:disabled) { background: #1a66e0; }
+  button.secondary { background: #fff; color: #333; border: 1px solid #ccc; }
+  button.secondary:hover:not(:disabled) { background: #f0f0f0; }
+
+  .meta { font-size: 13px; color: #666; margin-top: 10px; text-align: center; line-height: 1.5; }
+  
+  @media print { 
+    .noprint { display: none; } 
+    body { background: white; }
+    .canvas-container { border: none; box-shadow: none; }
+  }
 </style>
 </head>
 <body>
 
-<h1>🎙 Анализ голоса — спектрограмма</h1>
-<div class="hint">
+<h1>🎙 Анализ голоса (Log Scale)</h1>
+<div class="hint noprint">
   <b>Инструкция:</b> зажмите <kbd>Пробел</kbd> и произнесите в микрофон протяжно любую гласную
   (например, «Ааааа…»). Отпустите пробел — запись остановится, построится спектрограмма.
+  <br><i>Шкала частот теперь логарифмическая: хорошо видны высокие гармоники (до 10–20 кГц).</i>
 </div>
 
 <div id="status">Готово. Зажмите пробел для записи.</div>
 
-<canvas id="spectrogram" width="900" height="360"></canvas>
+<div class="canvas-container">
+  <canvas id="spectrogram" width="900" height="400"></canvas>
+</div>
 <div class="meta" id="meta"></div>
 
 <div class="controls noprint">
   <button id="btnWav" disabled>💾 Скачать WAV</button>
-  <button id="btnPdf" disabled>📄 Сформировать отчёт PDF</button>
+  <button id="btnPdf" disabled>📄 Отчёт PDF</button>
   <button id="btnPrint" disabled>🖨 Печать</button>
-  <button id="btnClear">🗑 Очистить</button>
+  <button id="btnClear" class="secondary">🗑 Очистить</button>
 </div>
 
 <script>
 /* =========================================================
-   1. Запись с микрофона по удержанию пробела
+   1. Запись с микрофона
    ========================================================= */
 const statusEl  = document.getElementById('status');
 const canvas    = document.getElementById('spectrogram');
@@ -57,6 +73,7 @@ let recording = false;
 let lastWavBlob = null;
 let lastWavUrl  = null;
 let lastMeta    = null;
+let lastInfo    = null; // Сохраняем данные спектрограммы для PDF
 
 async function ensureAudioContext() {
   if (!audioCtx) {
@@ -73,12 +90,11 @@ async function startRecording() {
       echoCancellation: false, noiseSuppression: false, autoGainControl: false
     }});
     const source = audioCtx.createMediaStreamSource(micStream);
-    // ScriptProcessorNode — устарел, но работает везде без зависимостей.
     processor = audioCtx.createScriptProcessor(4096, 1, 1);
     processor.onaudioprocess = e => {
       if (!recording) return;
       const data = e.inputBuffer.getChannelData(0);
-      recBuffer.push(new Float32Array(data)); // копия
+      recBuffer.push(new Float32Array(data));
     };
     source.connect(processor);
     processor.connect(audioCtx.destination);
@@ -96,24 +112,26 @@ async function stopRecording() {
   if (processor) { processor.disconnect(); processor.onaudioprocess = null; }
   if (micStream) micStream.getTracks().forEach(t => t.stop());
 
-  // Склеиваем куски
   const totalLen = recBuffer.reduce((s, a) => s + a.length, 0);
   const merged = new Float32Array(totalLen);
   let off = 0;
   for (const chunk of recBuffer) { merged.set(chunk, off); off += chunk.length; }
 
   if (totalLen < audioCtx.sampleRate * 0.2) {
-    statusEl.textContent = 'Слишком короткая запись — отброшено.';
+    statusEl.textContent = 'Слишком короткая запись.';
     return;
   }
 
   statusEl.textContent = 'Обработка…';
-  await processRecording(merged, audioCtx.sampleRate);
-  statusEl.textContent = 'Готово. Зажмите пробел для новой записи.';
+  // Небольшая задержка, чтобы UI успел обновиться
+  setTimeout(() => {
+    processRecording(merged, audioCtx.sampleRate);
+    statusEl.textContent = 'Готово. Зажмите пробел для новой записи.';
+  }, 50);
 }
 
 /* =========================================================
-   2. Формирование WAV (PCM 16-bit, mono)
+   2. Формирование WAV
    ========================================================= */
 function encodeWAV(samples, sampleRate) {
   const buffer = new ArrayBuffer(44 + samples.length * 2);
@@ -122,13 +140,13 @@ function encodeWAV(samples, sampleRate) {
   writeStr(0, 'RIFF');
   view.setUint32(4, 36 + samples.length * 2, true);
   writeStr(8, 'WAVE'); writeStr(12, 'fmt ');
-  view.setUint32(16, 16, true);          // размер fmt
-  view.setUint16(20, 1, true);           // PCM
-  view.setUint16(22, 1, true);           // 1 канал
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
   view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * 2, true); // байт/сек
-  view.setUint16(32, 2, true);           // блок
-  view.setUint16(34, 16, true);          // бит
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
   writeStr(36, 'data');
   view.setUint32(40, samples.length * 2, true);
   let offset = 44;
@@ -141,7 +159,7 @@ function encodeWAV(samples, sampleRate) {
 }
 
 /* =========================================================
-   3. FFT (Cooley–Tukey, radix-2) + спектрограмма
+   3. FFT и Спектрограмма
    ========================================================= */
 function hannWindow(N) {
   const w = new Float32Array(N);
@@ -150,7 +168,6 @@ function hannWindow(N) {
 }
 function fft(re, im) {
   const n = re.length;
-  // бит-реверсная перестановка
   for (let i = 1, j = 0; i < n; i++) {
     let bit = n >> 1;
     for (; j & bit; bit >>= 1) j ^= bit;
@@ -180,17 +197,15 @@ function fft(re, im) {
 
 function buildSpectrogram(samples, sampleRate) {
   const fftSize = 2048;
-  const hop     = fftSize / 2;          // перекрытие 50%
+  const hop     = fftSize / 2;
   const window  = hannWindow(fftSize);
   const frames  = Math.floor((samples.length - fftSize) / hop) + 1;
   const bins    = fftSize / 2;
 
-  // Нормализуем по пиковой амплитуде
   let peak = 0;
   for (let i = 0; i < samples.length; i++) peak = Math.max(peak, Math.abs(samples[i]));
   const norm = peak > 0 ? 1 / peak : 1;
 
-  // Матрица спектра (в дБ)
   const spec = new Float32Array(frames * bins);
   let maxDb = -120, minDb = -90;
   const re = new Float32Array(fftSize);
@@ -214,8 +229,13 @@ function buildSpectrogram(samples, sampleRate) {
   return { spec, frames, bins, sampleRate, fftSize, hop, maxDb, minDb };
 }
 
+/* =========================================================
+   4. Отрисовка с ЛОГАРИФМИЧЕСКОЙ шкалой
+   ========================================================= */
 function drawSpectrogram(info) {
   const { spec, frames, bins, sampleRate, fftSize, hop, maxDb, minDb } = info;
+  lastInfo = info; // сохраняем для PDF
+
   const W = canvas.width, H = canvas.height;
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, W, H);
@@ -224,54 +244,108 @@ function drawSpectrogram(info) {
   const dynRange = Math.max(6, maxDb - minDb);
   const floor = maxDb - dynRange;
 
+  // Предварительный расчет массива индексов бинов для каждой строки Y
+  // Чтобы не считать логарифмы внутри горячего цикла пикселей
+  const nyquist = sampleRate / 2;
+  const minFreq = 20; // Нижняя граница отображения (Гц)
+  const maxFreq = Math.min(nyquist, 22000); // Верхняя граница
+  
+  // Массив соответствия: y -> binIndex
+  const yToBin = new Int32Array(H);
+  for (let y = 0; y < H; y++) {
+    // Нормализуем y от 0 (низ canvas, низкие частоты) до 1 (верх canvas, высокие частоты)
+    // Но в canvas y=0 это верх. Поэтому инвертируем логику координат.
+    // Пусть y=H-1 будет низом (minFreq), y=0 будет верхом (maxFreq).
+    
+    const normalizedY = 1 - (y / H); // 0 внизу, 1 вверху
+    
+    // Логарифмическое преобразование: freq = min * (max/min)^normalizedY
+    const logMin = Math.log(minFreq);
+    const logMax = Math.log(maxFreq);
+    const freq = Math.exp(logMin + normalizedY * (logMax - logMin));
+    
+    // Перевод частоты в индекс бина FFT
+    // bin = freq * fftSize / sampleRate
+    let binIdx = Math.floor(freq * fftSize / sampleRate);
+    if (binIdx >= bins) binIdx = bins - 1;
+    if (binIdx < 0) binIdx = 0;
+    yToBin[y] = binIdx;
+  }
+
+  // Основной цикл отрисовки
   for (let x = 0; x < W; x++) {
     const f = Math.min(frames - 1, Math.floor(x * frames / W));
+    const frameOffset = f * bins;
+    
     for (let y = 0; y < H; y++) {
-      // низ canvas — низкие частоты
-      const k = Math.min(bins - 1, Math.floor((1 - y / H) * bins));
-      const db = spec[f * bins + k];
+      const k = yToBin[y];
+      const db = spec[frameOffset + k];
+      
       let t = (db - floor) / dynRange;
       t = Math.max(0, Math.min(1, t));
-      // Цветовая палитра (холодная → тёплая)
+      
+      // Цветовая палитра (Inferno-like)
       let r, g, b;
       if (t < 0.25)      { r = 0;            g = 0;            b = Math.floor(128 + t * 4 * 127); }
       else if (t < 0.5)  { const u = (t-0.25)*4; r = 0;            g = Math.floor(u*255); b = Math.floor(255*(1-u)); }
       else if (t < 0.75) { const u = (t-0.5)*4;  r = Math.floor(u*255); g = 255;           b = 0; }
       else               { const u = (t-0.75)*4; r = 255;          g = Math.floor(255*(1-u)); b = 0; }
+      
       const idx = (y * W + x) * 4;
       img.data[idx] = r; img.data[idx+1] = g; img.data[idx+2] = b; img.data[idx+3] = 255;
     }
   }
   ctx.putImageData(img, 0, 0);
 
-  // Оси
-  ctx.strokeStyle = '#fff'; ctx.fillStyle = '#fff';
-  ctx.font = '12px system-ui';
+  // --- Отрисовка сетки и подписей ---
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+  ctx.fillStyle = '#fff';
+  ctx.font = '11px system-ui';
+  ctx.lineWidth = 1;
+
+  // Ось X (Время)
   const dur = frames * hop / sampleRate;
-  for (let s = 0; s <= dur; s += 0.1) {
+  const timeStep = dur > 2 ? 0.5 : 0.1;
+  for (let s = 0; s <= dur; s += timeStep) {
     const x = (s / dur) * W;
-    ctx.beginPath(); ctx.moveTo(x, H - 10); ctx.lineTo(x, H); ctx.stroke();
-    if (Math.round(s * 10) % 5 === 0) ctx.fillText(s.toFixed(1) + 'с', x + 2, H - 14);
+    ctx.beginPath(); ctx.moveTo(x, H - 15); ctx.lineTo(x, H); ctx.stroke();
+    if (Math.round(s * 10) % 5 === 0) ctx.fillText(s.toFixed(1) + 'с', x + 2, H - 4);
   }
-  const maxFreq = sampleRate / 2;
-  for (let f = 0; f <= maxFreq; f += 1000) {
-    const y = H - (f / maxFreq) * H;
-    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(6, y); ctx.stroke();
-    ctx.fillText((f/1000).toFixed(0) + 'кГц', 8, y - 2);
-  }
+
+  // Ось Y (Частота, логарифмическая)
+  // Выбираем красивые значения частот: 100, 200, 500, 1k, 2k, 5k, 10k...
+  const niceFreqs = [100, 200, 500, 1000, 2000, 5000, 10000, 15000, 20000];
+  
+  niceFreqs.forEach(freq => {
+    if (freq < minFreq || freq > maxFreq) return;
+    
+    // Обратное преобразование: freq -> y
+    const logMin = Math.log(minFreq);
+    const logMax = Math.log(maxFreq);
+    const normalizedY = (Math.log(freq) - logMin) / (logMax - logMin);
+    
+    // normalizedY: 0 (низ) -> 1 (верх). Canvas Y: H (низ) -> 0 (верх)
+    const y = H * (1 - normalizedY);
+    
+    ctx.beginPath(); 
+    ctx.moveTo(0, y); 
+    ctx.lineTo(W, y); 
+    ctx.stroke();
+    
+    let label = freq >= 1000 ? (freq/1000) + 'кГц' : freq + 'Гц';
+    ctx.fillText(label, 5, y - 2);
+  });
 }
 
 /* =========================================================
-   4. Обработка записи
+   5. Обработка записи
    ========================================================= */
 async function processRecording(samples, sampleRate) {
-  // WAV
   const wavBlob = encodeWAV(samples, sampleRate);
   if (lastWavUrl) URL.revokeObjectURL(lastWavUrl);
   lastWavUrl = URL.createObjectURL(wavBlob);
   lastWavBlob = wavBlob;
 
-  // Спектрограмма
   const info = buildSpectrogram(samples, sampleRate);
   drawSpectrogram(info);
 
@@ -284,15 +358,13 @@ async function processRecording(samples, sampleRate) {
     samples: samples.length,
     fftSize: info.fftSize,
     hop: info.hop,
-    maxDb: info.maxDb.toFixed(1),
-    dynRange: (info.maxDb - (info.maxDb - Math.max(6, info.maxDb - info.minDb))).toFixed(1)
+    maxDb: info.maxDb.toFixed(1)
   };
   metaEl.innerHTML =
     `Дата: <b>${lastMeta.date}</b> · ` +
     `Длительность: <b>${lastMeta.duration} с</b> · ` +
     `Частота дискретизации: <b>${sampleRate} Гц</b> · ` +
-    `Отсчётов: <b>${samples.length}</b> · ` +
-    `FFT: <b>${info.fftSize}</b>, шаг: <b>${info.hop}</b> · ` +
+    `FFT: <b>${info.fftSize}</b> · ` +
     `Пик: <b>${lastMeta.maxDb} дБ</b>`;
 
   btnWav.disabled = false;
@@ -301,7 +373,7 @@ async function processRecording(samples, sampleRate) {
 }
 
 /* =========================================================
-   5. Управление клавиатурой
+   6. Управление
    ========================================================= */
 window.addEventListener('keydown', e => {
   if (e.code === 'Space' && !e.repeat) { e.preventDefault(); startRecording(); }
@@ -309,12 +381,8 @@ window.addEventListener('keydown', e => {
 window.addEventListener('keyup', e => {
   if (e.code === 'Space') { e.preventDefault(); stopRecording(); }
 });
-// Защита: если окно потеряло фокус во время записи — остановить
 window.addEventListener('blur', () => { if (recording) stopRecording(); });
 
-/* =========================================================
-   6. Кнопки
-   ========================================================= */
 btnWav.addEventListener('click', () => {
   if (!lastWavBlob) return;
   const a = document.createElement('a');
@@ -330,13 +398,13 @@ btnClear.addEventListener('click', () => {
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
   metaEl.textContent = '';
   btnWav.disabled = btnPdf.disabled = btnPrint.disabled = true;
-  lastWavBlob = null;
+  lastWavBlob = null; lastInfo = null;
   if (lastWavUrl) { URL.revokeObjectURL(lastWavUrl); lastWavUrl = null; }
   lastMeta = null;
 });
 
 /* =========================================================
-   7. Отчёт PDF (jsPDF)
+   7. Отчёт PDF
    ========================================================= */
 btnPdf.addEventListener('click', async () => {
   if (!lastWavBlob || !lastMeta) return;
@@ -344,35 +412,30 @@ btnPdf.addEventListener('click', async () => {
   const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
 
   const W = doc.internal.pageSize.getWidth();
-  const H = doc.internal.pageSize.getHeight();
-
-  // Заголовок
+  
   doc.setFont('helvetica', 'bold'); doc.setFontSize(18);
-  doc.text('Отчёт по анализу голоса (спектрограмма)', 40, 40);
+  doc.text('Отчёт: Спектральный анализ (Log Scale)', 40, 40);
 
   doc.setFont('helvetica', 'normal'); doc.setFontSize(11);
   const lines = [
-    `Дата и время записи: ${lastMeta.date}`,
+    `Дата: ${lastMeta.date}`,
     `Длительность: ${lastMeta.duration} с`,
     `Частота дискретизации: ${lastMeta.sampleRate} Гц`,
-    `Количество отсчётов: ${lastMeta.samples}`,
-    `Размер БПФ: ${lastMeta.fftSize}, шаг окна (hop): ${lastMeta.hop}`,
-    `Пиковая амплитуда: ${lastMeta.maxDb} дБ (относительно максимума)`
+    `Размер БПФ: ${lastMeta.fftSize}`,
+    `Пиковая амплитуда: ${lastMeta.maxDb} дБ`
   ];
   lines.forEach((t, i) => doc.text(t, 40, 70 + i * 16));
 
-  // Спектрограмма как PNG
   const imgData = canvas.toDataURL('image/png');
   const imgW = W - 80;
   const imgH = imgW * (canvas.height / canvas.width);
   doc.addImage(imgData, 'PNG', 40, 70 + lines.length * 16 + 10, imgW, imgH);
 
-  // Подпись
   doc.setFontSize(9);
-  doc.text('Сформировано автоматически в браузере (Web Audio API + FFT).', 40, H - 30);
+  doc.text('Шкала частот: логарифмическая (20 Гц – 20 кГц).', 40, doc.internal.pageSize.getHeight() - 30);
 
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
-  doc.save(`voice_report_${ts}.pdf`);
+  doc.save(`report_log_${ts}.pdf`);
 });
 </script>
 </body>
