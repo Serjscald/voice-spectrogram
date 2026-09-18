@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Анализ голоса — спектрограмма</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 960px; margin: 20px auto; padding: 0 16px; color: #222; }
+  h1 { margin: 0 0 10px; }
+  .hint { background: #eef6ff; border-left: 4px solid #2b7cff; padding: 10px 14px; border-radius: 4px; }
+  #status { margin: 14px 0; font-size: 18px; font-weight: 600; }
+  .rec { color: #d33; }
+  canvas { display: block; width: 100%; max-width: 900px; border: 1px solid #bbb; background: #000; margin-top: 8px; }
+  .controls { margin: 14px 0; display: flex; gap: 10px; flex-wrap: wrap; }
+  button { padding: 10px 16px; font-size: 15px; cursor: pointer; border: 1px solid #666; background: #fafafa; border-radius: 4px; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button:hover:not(:disabled) { background: #eef; }
+  .meta { font-size: 13px; color: #555; margin-top: 6px; }
+  @media print { .noprint { display: none; } }
+</style>
+</head>
+<body>
+
+<h1>🎙 Анализ голоса — спектрограмма</h1>
+<div class="hint">
+  <b>Инструкция:</b> зажмите <kbd>Пробел</kbd> и произнесите в микрофон протяжно любую гласную
+  (например, «Ааааа…»). Отпустите пробел — запись остановится, построится спектрограмма.
+</div>
+
+<div id="status">Готово. Зажмите пробел для записи.</div>
+
+<canvas id="spectrogram" width="900" height="360"></canvas>
+<div class="meta" id="meta"></div>
+
+<div class="controls noprint">
+  <button id="btnWav" disabled>💾 Скачать WAV</button>
+  <button id="btnPdf" disabled>📄 Сформировать отчёт PDF</button>
+  <button id="btnPrint" disabled>🖨 Печать</button>
+  <button id="btnClear">🗑 Очистить</button>
+</div>
+
+<script>
+/* =========================================================
+   1. Запись с микрофона по удержанию пробела
+   ========================================================= */
+const statusEl  = document.getElementById('status');
+const canvas    = document.getElementById('spectrogram');
+const ctx       = canvas.getContext('2d');
+const metaEl    = document.getElementById('meta');
+const btnWav    = document.getElementById('btnWav');
+const btnPdf    = document.getElementById('btnPdf');
+const btnPrint  = document.getElementById('btnPrint');
+const btnClear  = document.getElementById('btnClear');
+
+let audioCtx, processor, micStream, recBuffer = [];
+let recording = false;
+let lastWavBlob = null;
+let lastWavUrl  = null;
+let lastMeta    = null;
+
+async function ensureAudioContext() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
+  }
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+}
+
+async function startRecording() {
+  if (recording) return;
+  try {
+    await ensureAudioContext();
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: {
+      echoCancellation: false, noiseSuppression: false, autoGainControl: false
+    }});
+    const source = audioCtx.createMediaStreamSource(micStream);
+    // ScriptProcessorNode — устарел, но работает везде без зависимостей.
+    processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    processor.onaudioprocess = e => {
+      if (!recording) return;
+      const data = e.inputBuffer.getChannelData(0);
+      recBuffer.push(new Float32Array(data)); // копия
+    };
+    source.connect(processor);
+    processor.connect(audioCtx.destination);
+    recording = true;
+    recBuffer = [];
+    statusEl.innerHTML = '<span class="rec">● Идёт запись… удерживайте пробел и говорите</span>';
+  } catch (err) {
+    statusEl.textContent = 'Ошибка доступа к микрофону: ' + err.message;
+  }
+}
+
+async function stopRecording() {
+  if (!recording) return;
+  recording = false;
+  if (processor) { processor.disconnect(); processor.onaudioprocess = null; }
+  if (micStream) micStream.getTracks().forEach(t => t.stop());
+
+  // Склеиваем куски
+  const totalLen = recBuffer.reduce((s, a) => s + a.length, 0);
+  const merged = new Float32Array(totalLen);
+  let off = 0;
+  for (const chunk of recBuffer) { merged.set(chunk, off); off += chunk.length; }
+
+  if (totalLen < audioCtx.sampleRate * 0.2) {
+    statusEl.textContent = 'Слишком короткая запись — отброшено.';
+    return;
+  }
+
+  statusEl.textContent = 'Обработка…';
+  await processRecording(merged, audioCtx.sampleRate);
+  statusEl.textContent = 'Готово. Зажмите пробел для новой записи.';
+}
+
+/* =========================================================
+   2. Формирование WAV (PCM 16-bit, mono)
+   ========================================================= */
+function encodeWAV(samples, sampleRate) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  const writeStr = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)); };
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeStr(8, 'WAVE'); writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);          // размер fmt
+  view.setUint16(20, 1, true);           // PCM
+  view.setUint16(22, 1, true);           // 1 канал
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true); // байт/сек
+  view.setUint16(32, 2, true);           // блок
+  view.setUint16(34, 16, true);          // бит
+  writeStr(36, 'data');
+  view.setUint32(40, samples.length * 2, true);
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++) {
+    let s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    offset += 2;
+  }
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+/* =========================================================
+   3. FFT (Cooley–Tukey, radix-2) + спектрограмма
+   ========================================================= */
+function hannWindow(N) {
+  const w = new Float32Array(N);
+  for (let i = 0; i < N; i++) w[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (N - 1));
+  return w;
+}
+function fft(re, im) {
+  const n = re.length;
+  // бит-реверсная перестановка
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; }
+  }
+  for (let size = 2; size <= n; size <<= 1) {
+    const half = size >> 1;
+    const ang = -2 * Math.PI / size;
+    const wRe = Math.cos(ang), wIm = Math.sin(ang);
+    for (let start = 0; start < n; start += size) {
+      let curRe = 1, curIm = 0;
+      for (let k = 0; k < half; k++) {
+        const tRe = curRe * re[start + k + half] - curIm * im[start + k + half];
+        const tIm = curRe * im[start + k + half] + curIm * re[start + k + half];
+        re[start + k + half] = re[start + k] - tRe;
+        im[start + k + half] = im[start + k] - tIm;
+        re[start + k] += tRe;
+        im[start + k] += tIm;
+        const nRe = curRe * wRe - curIm * wIm;
+        curIm = curRe * wIm + curIm * wRe;
+        curRe = nRe;
+      }
+    }
+  }
+}
+
+function buildSpectrogram(samples, sampleRate) {
+  const fftSize = 2048;
+  const hop     = fftSize / 2;          // перекрытие 50%
+  const window  = hannWindow(fftSize);
+  const frames  = Math.floor((samples.length - fftSize) / hop) + 1;
+  const bins    = fftSize / 2;
+
+  // Нормализуем по пиковой амплитуде
+  let peak = 0;
+  for (let i = 0; i < samples.length; i++) peak = Math.max(peak, Math.abs(samples[i]));
+  const norm = peak > 0 ? 1 / peak : 1;
+
+  // Матрица спектра (в дБ)
+  const spec = new Float32Array(frames * bins);
+  let maxDb = -120, minDb = -90;
+  const re = new Float32Array(fftSize);
+  const im = new Float32Array(fftSize);
+
+  for (let f = 0; f < frames; f++) {
+    const off = f * hop;
+    for (let i = 0; i < fftSize; i++) {
+      re[i] = (samples[off + i] || 0) * window[i] * norm;
+      im[i] = 0;
+    }
+    fft(re, im);
+    for (let k = 0; k < bins; k++) {
+      const mag = Math.sqrt(re[k] * re[k] + im[k] * im[k]) / (fftSize / 2);
+      const db  = 20 * Math.log10(Math.max(mag, 1e-7));
+      spec[f * bins + k] = db;
+      if (db > maxDb) maxDb = db;
+      if (db < minDb) minDb = db;
+    }
+  }
+  return { spec, frames, bins, sampleRate, fftSize, hop, maxDb, minDb };
+}
+
+function drawSpectrogram(info) {
+  const { spec, frames, bins, sampleRate, fftSize, hop, maxDb, minDb } = info;
+  const W = canvas.width, H = canvas.height;
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+
+  const img = ctx.createImageData(W, H);
+  const dynRange = Math.max(6, maxDb - minDb);
+  const floor = maxDb - dynRange;
+
+  for (let x = 0; x < W; x++) {
+    const f = Math.min(frames - 1, Math.floor(x * frames / W));
+    for (let y = 0; y < H; y++) {
+      // низ canvas — низкие частоты
+      const k = Math.min(bins - 1, Math.floor((1 - y / H) * bins));
+      const db = spec[f * bins + k];
+      let t = (db - floor) / dynRange;
+      t = Math.max(0, Math.min(1, t));
+      // Цветовая палитра (холодная → тёплая)
+      let r, g, b;
+      if (t < 0.25)      { r = 0;            g = 0;            b = Math.floor(128 + t * 4 * 127); }
+      else if (t < 0.5)  { const u = (t-0.25)*4; r = 0;            g = Math.floor(u*255); b = Math.floor(255*(1-u)); }
+      else if (t < 0.75) { const u = (t-0.5)*4;  r = Math.floor(u*255); g = 255;           b = 0; }
+      else               { const u = (t-0.75)*4; r = 255;          g = Math.floor(255*(1-u)); b = 0; }
+      const idx = (y * W + x) * 4;
+      img.data[idx] = r; img.data[idx+1] = g; img.data[idx+2] = b; img.data[idx+3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+
+  // Оси
+  ctx.strokeStyle = '#fff'; ctx.fillStyle = '#fff';
+  ctx.font = '12px system-ui';
+  const dur = frames * hop / sampleRate;
+  for (let s = 0; s <= dur; s += 0.1) {
+    const x = (s / dur) * W;
+    ctx.beginPath(); ctx.moveTo(x, H - 10); ctx.lineTo(x, H); ctx.stroke();
+    if (Math.round(s * 10) % 5 === 0) ctx.fillText(s.toFixed(1) + 'с', x + 2, H - 14);
+  }
+  const maxFreq = sampleRate / 2;
+  for (let f = 0; f <= maxFreq; f += 1000) {
+    const y = H - (f / maxFreq) * H;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(6, y); ctx.stroke();
+    ctx.fillText((f/1000).toFixed(0) + 'кГц', 8, y - 2);
+  }
+}
+
+/* =========================================================
+   4. Обработка записи
+   ========================================================= */
+async function processRecording(samples, sampleRate) {
+  // WAV
+  const wavBlob = encodeWAV(samples, sampleRate);
+  if (lastWavUrl) URL.revokeObjectURL(lastWavUrl);
+  lastWavUrl = URL.createObjectURL(wavBlob);
+  lastWavBlob = wavBlob;
+
+  // Спектрограмма
+  const info = buildSpectrogram(samples, sampleRate);
+  drawSpectrogram(info);
+
+  const duration = samples.length / sampleRate;
+  const now = new Date();
+  lastMeta = {
+    date: now.toLocaleString('ru-RU'),
+    sampleRate,
+    duration: duration.toFixed(2),
+    samples: samples.length,
+    fftSize: info.fftSize,
+    hop: info.hop,
+    maxDb: info.maxDb.toFixed(1),
+    dynRange: (info.maxDb - (info.maxDb - Math.max(6, info.maxDb - info.minDb))).toFixed(1)
+  };
+  metaEl.innerHTML =
+    `Дата: <b>${lastMeta.date}</b> · ` +
+    `Длительность: <b>${lastMeta.duration} с</b> · ` +
+    `Частота дискретизации: <b>${sampleRate} Гц</b> · ` +
+    `Отсчётов: <b>${samples.length}</b> · ` +
+    `FFT: <b>${info.fftSize}</b>, шаг: <b>${info.hop}</b> · ` +
+    `Пик: <b>${lastMeta.maxDb} дБ</b>`;
+
+  btnWav.disabled = false;
+  btnPdf.disabled = false;
+  btnPrint.disabled = false;
+}
+
+/* =========================================================
+   5. Управление клавиатурой
+   ========================================================= */
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space' && !e.repeat) { e.preventDefault(); startRecording(); }
+});
+window.addEventListener('keyup', e => {
+  if (e.code === 'Space') { e.preventDefault(); stopRecording(); }
+});
+// Защита: если окно потеряло фокус во время записи — остановить
+window.addEventListener('blur', () => { if (recording) stopRecording(); });
+
+/* =========================================================
+   6. Кнопки
+   ========================================================= */
+btnWav.addEventListener('click', () => {
+  if (!lastWavBlob) return;
+  const a = document.createElement('a');
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  a.href = lastWavUrl;
+  a.download = `voice_${ts}.wav`;
+  a.click();
+});
+
+btnPrint.addEventListener('click', () => window.print());
+
+btnClear.addEventListener('click', () => {
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  metaEl.textContent = '';
+  btnWav.disabled = btnPdf.disabled = btnPrint.disabled = true;
+  lastWavBlob = null;
+  if (lastWavUrl) { URL.revokeObjectURL(lastWavUrl); lastWavUrl = null; }
+  lastMeta = null;
+});
+
+/* =========================================================
+   7. Отчёт PDF (jsPDF)
+   ========================================================= */
+btnPdf.addEventListener('click', async () => {
+  if (!lastWavBlob || !lastMeta) return;
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
+
+  const W = doc.internal.pageSize.getWidth();
+  const H = doc.internal.pageSize.getHeight();
+
+  // Заголовок
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(18);
+  doc.text('Отчёт по анализу голоса (спектрограмма)', 40, 40);
+
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(11);
+  const lines = [
+    `Дата и время записи: ${lastMeta.date}`,
+    `Длительность: ${lastMeta.duration} с`,
+    `Частота дискретизации: ${lastMeta.sampleRate} Гц`,
+    `Количество отсчётов: ${lastMeta.samples}`,
+    `Размер БПФ: ${lastMeta.fftSize}, шаг окна (hop): ${lastMeta.hop}`,
+    `Пиковая амплитуда: ${lastMeta.maxDb} дБ (относительно максимума)`
+  ];
+  lines.forEach((t, i) => doc.text(t, 40, 70 + i * 16));
+
+  // Спектрограмма как PNG
+  const imgData = canvas.toDataURL('image/png');
+  const imgW = W - 80;
+  const imgH = imgW * (canvas.height / canvas.width);
+  doc.addImage(imgData, 'PNG', 40, 70 + lines.length * 16 + 10, imgW, imgH);
+
+  // Подпись
+  doc.setFontSize(9);
+  doc.text('Сформировано автоматически в браузере (Web Audio API + FFT).', 40, H - 30);
+
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  doc.save(`voice_report_${ts}.pdf`);
+});
+</script>
+</body>
+</html>
